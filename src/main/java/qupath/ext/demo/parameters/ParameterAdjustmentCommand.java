@@ -24,17 +24,28 @@ import javafx.collections.FXCollections;
 import javafx.collections.MapChangeListener;
 import javafx.collections.ObservableMap;
 import javafx.geometry.Insets;
+import javafx.geometry.Orientation;
 import javafx.scene.Scene;
+import javafx.scene.chart.BarChart;
+import javafx.scene.chart.CategoryAxis;
+import javafx.scene.chart.NumberAxis;
+import javafx.scene.chart.XYChart;
+import javafx.scene.control.Separator;
+import javafx.scene.control.SplitPane;
 import javafx.scene.control.TableCell;
 import javafx.scene.control.TableColumn;
 import javafx.scene.control.TableView;
 import javafx.scene.layout.BorderPane;
 import javafx.scene.layout.GridPane;
+import javafx.scene.layout.HBox;
 import javafx.scene.layout.Pane;
+import javafx.scene.layout.Priority;
+import javafx.scene.layout.VBox;
 import javafx.stage.Stage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import qupath.imagej.processing.RoiLabeling;
+import qupath.imagej.processing.SimpleThresholding;
 import qupath.imagej.tools.IJTools;
 import qupath.lib.analysis.images.ContourTracing;
 import qupath.lib.analysis.images.SimpleImage;
@@ -73,6 +84,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.stream.Collectors;
 
 public class ParameterAdjustmentCommand implements Runnable {
 
@@ -108,6 +120,11 @@ public class ParameterAdjustmentCommand implements Runnable {
     private Map<ImagePlus, FloatProcessor> noiseCache = new ConcurrentHashMap<>();
 
     private ExecutorService pool = Executors.newCachedThreadPool(ThreadTools.createThreadFactory("parameter-test", true));
+
+    private XYChart.Series<String, Number> seriesCounts = new XYChart.Series<>();
+    private XYChart.Series<String, Number> seriesMeanArea = new XYChart.Series<>();
+    private XYChart.Series<String, Number> seriesMeanIntensity = new XYChart.Series<>();
+
 
     ParameterAdjustmentCommand(QuPathGUI qupath) {
         this.qupath = qupath;
@@ -148,14 +165,6 @@ public class ParameterAdjustmentCommand implements Runnable {
                 5.0,
                 "The sigma for the Gaussian blur used to smooth the image before thresholding.");
 
-        params.addDoubleParameter("tolerance",
-                "Tolerance",
-                1.0,
-                "",
-                0.0,
-                10.0,
-                "The watershed tolerance");
-
         List<String> methods = new ArrayList<>();
         String manual = "Manual";
         methods.add(manual);
@@ -175,14 +184,30 @@ public class ParameterAdjustmentCommand implements Runnable {
                 255,
                 "The absolute threshold value.");
 
-        params.addTitleParameter("Quality parameters");
-        params.addDoubleParameter("noise",
-                "Noise sigma",
+        params.addBooleanParameter("doWatershed",
+                "Watershed",
+                false,
+                "Apply a watershed transform to the smoothed image");
+
+        params.addDoubleParameter("tolerance",
+                "Tolerance",
                 0.0,
                 "",
                 0.0,
-                50,
-                "The sigma value of Gaussian noise added to the image");
+                10.0,
+                "The watershed tolerance");
+
+        boolean useQuality = false;
+        if (useQuality) {
+            params.addTitleParameter("Quality parameters");
+            params.addDoubleParameter("noise",
+                    "Noise sigma",
+                    0.0,
+                    "",
+                    0.0,
+                    50,
+                    "The sigma value of Gaussian noise added to the image");
+        }
 
 //        params.addChoiceParameter("connectivity",
 //                "Connectivity",
@@ -216,6 +241,11 @@ public class ParameterAdjustmentCommand implements Runnable {
         table.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY);
         resultsMap.addListener((MapChangeListener<ImageData<?>, AnalysisResult>) change -> {
             table.getItems().setAll(resultsMap.values());
+            updateBarCharts();
+        });
+
+        parameterPanel.addParameterChangeListener((a, b, c) -> {
+            parameterPanel.setParameterEnabled("tolerance", params.getBooleanParameterValue("doWatershed"));
         });
 //        resultsProperty.addListener((v, o, n) -> {
 //            if (n != null) {
@@ -229,8 +259,29 @@ public class ParameterAdjustmentCommand implements Runnable {
 
         BorderPane parameterPane = new BorderPane(parameterPanel.getPane());
         parameterPane.setPadding(new Insets(5.0));
-        BorderPane pane = new BorderPane(parameterPane);
-        pane.setBottom(table);
+        var separator = new Separator();
+        parameterPane.setBottom(separator);
+        separator.setPadding(new Insets(10.0));
+
+        BorderPane pane = new BorderPane();
+        pane.setTop(parameterPane);
+
+        var chartPane = new HBox(
+                createBarChart("Counts", seriesCounts),
+                createBarChart("Mean area", seriesMeanArea),
+                createBarChart("Mean intensity", seriesMeanIntensity)
+        );
+        for (var child : chartPane.getChildren()) {
+            HBox.setHgrow(child, Priority.ALWAYS);
+        }
+        chartPane.setFillHeight(true);
+//        var splitPane = new SplitPane(
+//                table,
+//                chartPane
+//                );
+//        splitPane.setOrientation(Orientation.VERTICAL);
+//        pane.setBottom(new BorderPane(splitPane));
+        pane.setCenter(chartPane);
 
         Stage stage = new Stage();
         stage.initOwner(qupath.getStage());
@@ -266,6 +317,94 @@ public class ParameterAdjustmentCommand implements Runnable {
             logger.warn("Failed to load image", e);
             return null;
         }
+    }
+
+    private BarChart<String, Number> createBarChart(String title, XYChart.Series<String, Number> series) {
+        var xAxis = new CategoryAxis();
+        var yAxis = new NumberAxis();
+        BarChart<String, Number> barChart = new BarChart<>(xAxis, yAxis);
+        barChart.setTitle(title);
+        barChart.getData().add(series);
+        barChart.setPrefHeight(120.0);
+        barChart.setPrefWidth(120.0);
+        barChart.setMinHeight(60);
+        barChart.setMinWidth(60);
+        barChart.setStyle("-fx-font-size: 11px;");
+        barChart.setCategoryGap(0);
+        barChart.setBarGap(2);
+        barChart.setAnimated(false);
+        barChart.setLegendVisible(false);
+        barChart.setOnMouseClicked(e -> {
+            if (e.getClickCount() == 2) {
+                yAxis.setAutoRanging(true);
+//                yAxis.setAutoRanging(false);
+            }
+        });
+        yAxis.setMinorTickVisible(false);
+        yAxis.setTickMarkVisible(false);
+        yAxis.setAutoRanging(false);
+        yAxis.setLowerBound(0);
+        return barChart;
+    }
+
+    private void updateBarCharts() {
+        List<XYChart.Data<String, Number>> counts = new ArrayList<>();
+        List<XYChart.Data<String, Number>> areas = new ArrayList<>();
+        List<XYChart.Data<String, Number>> intensities = new ArrayList<>();
+        int maxCounts = 0;
+        double maxAreas = 0;
+        double maxIntensities = 0;
+        for (var entry : resultsMap.entrySet()) {
+            var imageData = entry.getKey();
+            var result = entry.getValue();
+            var title = getName(imageData);
+            var numObjects = result.numObjects.get();
+            maxCounts = Math.max(maxCounts, numObjects);
+            var meanArea = result.meanArea.get();
+            maxAreas = Math.max(maxAreas, meanArea);
+            var meanIntensity = result.meanIntensity.get();
+            maxIntensities = Math.max(maxIntensities, meanIntensity);
+            counts.add(new XYChart.Data<>(title, numObjects));
+            areas.add(new XYChart.Data<>(title, meanArea));
+            intensities.add(new XYChart.Data<>(title, meanIntensity));
+        }
+        seriesCounts.getData().setAll(counts);
+        var yAxis = ((NumberAxis)seriesCounts.getChart().getYAxis());
+        yAxis.setAutoRanging(false);
+        yAxis.setUpperBound(Math.max(yAxis.getUpperBound(), maxCounts * 1.1));
+
+        seriesMeanArea.getData().setAll(areas);
+        yAxis = ((NumberAxis)seriesMeanArea.getChart().getYAxis());
+        yAxis.setAutoRanging(false);
+        yAxis.setUpperBound(Math.max(yAxis.getUpperBound(), maxAreas * 1.1));
+
+        seriesMeanIntensity.getData().setAll(intensities);
+        yAxis = ((NumberAxis)seriesMeanIntensity.getChart().getYAxis());
+        yAxis.setAutoRanging(false);
+        yAxis.setUpperBound(Math.max(yAxis.getUpperBound(), maxIntensities * 1.1));
+
+        int count = 1;
+        for (var data : seriesCounts.getData()) {
+            data.getNode().setStyle("-fx-background-color: CHART_COLOR_" + count + ";");
+            count++;
+        }
+        count = 1;
+        for (var data : seriesMeanArea.getData()) {
+            data.getNode().setStyle("-fx-background-color: CHART_COLOR_" + count + ";");
+            count++;
+        }
+        count = 1;
+        for (var data : seriesMeanIntensity.getData()) {
+            data.getNode().setStyle("-fx-background-color: CHART_COLOR_" + count + ";");
+            count++;
+        }
+    }
+
+    private static <T> void setOrAdd(List<T> list, T item, int ind) {
+        if (ind < list.size())
+            list.set(ind, item);
+        else
+            list.add(item);
     }
 
 
@@ -387,34 +526,38 @@ public class ParameterAdjustmentCommand implements Runnable {
         double sigma = params.getDoubleParameterValue("gaussianSigma");
         String thresholdMethod = (String)params.getChoiceParameterValue("autoThreshold");
         double threshold = params.getDoubleParameterValue("threshold");
+        boolean doWatershed =  params.containsKey("doWatershed") ?  params.getBooleanParameterValue("doWatershed") : true;
         double tolerance = params.getDoubleParameterValue("tolerance");
-        double noise = params.getDoubleParameterValue("noise");
 
         if (Thread.interrupted())
             return null;
 
-        if (noise > 0) {
-            var noiseProcessor = noiseCache.computeIfAbsent(imp, imp2 -> {
-                var fpNoise = new FloatProcessor(imp2.getWidth(), imp2.getHeight());
-                fpNoise.noise(1.0);
-                return fpNoise;
-            });
-            float[] pixels = (float[]) fp.getPixels();
-            float[] noisePixels = (float[]) noiseProcessor.getPixels();
-            for (int i = 0; i < pixels.length; i++)
-                pixels[i] += noisePixels[i] * (float) noise;
-        }
+        if (params.containsKey("noise")) {
+            double noise = params.getDoubleParameterValue("noise");
 
-        for (var v : qupath.getViewers()) {
-            if (v.getImageData() == imageData) {
-                var channel = v.getImageDisplay().availableChannels().get(0);
-                fp.setMinAndMax(channel.getMinDisplay(), channel.getMaxDisplay());
-                var overlay = new BufferedImageOverlay(v, fp.getBufferedImage());
-                if (noise > 0)
-                    v.setCustomPixelLayerOverlay(overlay);
-                else
-                    v.resetCustomPixelLayerOverlay();
-                break;
+            if (noise > 0) {
+                var noiseProcessor = noiseCache.computeIfAbsent(imp, imp2 -> {
+                    var fpNoise = new FloatProcessor(imp2.getWidth(), imp2.getHeight());
+                    fpNoise.noise(1.0);
+                    return fpNoise;
+                });
+                float[] pixels = (float[]) fp.getPixels();
+                float[] noisePixels = (float[]) noiseProcessor.getPixels();
+                for (int i = 0; i < pixels.length; i++)
+                    pixels[i] += noisePixels[i] * (float) noise;
+            }
+
+            for (var v : qupath.getViewers()) {
+                if (v.getImageData() == imageData) {
+                    var channel = v.getImageDisplay().availableChannels().get(0);
+                    fp.setMinAndMax(channel.getMinDisplay(), channel.getMaxDisplay());
+                    var overlay = new BufferedImageOverlay(v, fp.getBufferedImage());
+                    if (noise > 0)
+                        v.setCustomPixelLayerOverlay(overlay);
+                    else
+                        v.resetCustomPixelLayerOverlay();
+                    break;
+                }
             }
         }
 
@@ -435,7 +578,12 @@ public class ParameterAdjustmentCommand implements Runnable {
         if (Thread.interrupted())
             return null;
 
-        ByteProcessor bp = new MaximumFinder().findMaxima(fp, tolerance, threshold, MaximumFinder.SEGMENTED, false, false);
+        ByteProcessor bp;
+        if (doWatershed)
+            bp = new MaximumFinder().findMaxima(fp, tolerance, threshold, MaximumFinder.SEGMENTED, false, false);
+        else
+            bp = SimpleThresholding.thresholdAbove(fp, (float)threshold);
+
         if (Thread.interrupted())
             return null;
 
