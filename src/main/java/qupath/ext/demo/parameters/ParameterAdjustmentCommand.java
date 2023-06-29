@@ -5,7 +5,10 @@ import ij.ImagePlus;
 import ij.gui.Roi;
 import ij.measure.Measurements;
 import ij.plugin.filter.MaximumFinder;
+import ij.process.AutoThresholder;
+import ij.process.Blitter;
 import ij.process.ByteProcessor;
+import ij.process.FloatProcessor;
 import ij.process.ImageProcessor;
 import ij.process.ImageStatistics;
 import javafx.application.Platform;
@@ -17,6 +20,9 @@ import javafx.beans.property.SimpleIntegerProperty;
 import javafx.beans.property.SimpleObjectProperty;
 import javafx.beans.property.SimpleStringProperty;
 import javafx.beans.property.StringProperty;
+import javafx.collections.FXCollections;
+import javafx.collections.MapChangeListener;
+import javafx.collections.ObservableMap;
 import javafx.geometry.Insets;
 import javafx.scene.Scene;
 import javafx.scene.control.TableCell;
@@ -40,6 +46,7 @@ import qupath.lib.gui.QuPathGUI;
 import qupath.lib.gui.charts.HistogramPanelFX;
 import qupath.lib.gui.dialogs.Dialogs;
 import qupath.lib.gui.dialogs.ParameterPanelFX;
+import qupath.lib.gui.viewer.overlays.BufferedImageOverlay;
 import qupath.lib.images.ImageData;
 import qupath.lib.objects.PathObject;
 import qupath.lib.plugins.parameters.ParameterChangeListener;
@@ -55,13 +62,17 @@ import java.text.NumberFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.TreeMap;
 import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 public class ParameterAdjustmentCommand implements Runnable {
 
@@ -84,14 +95,29 @@ public class ParameterAdjustmentCommand implements Runnable {
 
     private Map<ImageData<BufferedImage>, ImagePlus> imageMap = new ConcurrentHashMap<>();
 
-    private ObjectProperty<AnalysisResult> resultsProperty = new SimpleObjectProperty<>();
+    private Map<ImageData<BufferedImage>, Future<?>> runningTasks = new ConcurrentHashMap<>();
+
+    private Comparator<ImageData<?>> comparator = Comparator.comparing(ParameterAdjustmentCommand::getName)
+            .thenComparing(ImageData::getServerPath);
+
+    private ObservableMap<ImageData<?>, AnalysisResult> resultsMap = FXCollections.observableMap(
+            new TreeMap<>(comparator));
 
     private Map<String, AnalysisResult> cachedResults = new ConcurrentHashMap<>();
+
+    private Map<ImagePlus, FloatProcessor> noiseCache = new ConcurrentHashMap<>();
 
     private ExecutorService pool = Executors.newCachedThreadPool(ThreadTools.createThreadFactory("parameter-test", true));
 
     ParameterAdjustmentCommand(QuPathGUI qupath) {
         this.qupath = qupath;
+    }
+
+    private static String getName(ImageData<?> imageData) {
+        if (imageData == null)
+            return "";
+        else
+            return imageData.getServer().getMetadata().getName();
     }
 
     @Override
@@ -112,6 +138,8 @@ public class ParameterAdjustmentCommand implements Runnable {
     private Stage createStage() {
 
         ParameterList params = new ParameterList();
+
+        params.addTitleParameter("Analysis parameters");
         params.addDoubleParameter("gaussianSigma",
                 "Gaussian sigma",
                 1.0,
@@ -128,6 +156,17 @@ public class ParameterAdjustmentCommand implements Runnable {
                 10.0,
                 "The watershed tolerance");
 
+        List<String> methods = new ArrayList<>();
+        String manual = "Manual";
+        methods.add(manual);
+        for (var method : AutoThresholder.getMethods())
+            methods.add(method);
+        params.addChoiceParameter("autoThreshold",
+                "Auto threshold",
+                manual,
+                methods,
+                "The automated thresholding method.");
+
         params.addDoubleParameter("threshold",
                 "Threshold",
                 1.0,
@@ -135,6 +174,15 @@ public class ParameterAdjustmentCommand implements Runnable {
                 0.0,
                 255,
                 "The absolute threshold value.");
+
+        params.addTitleParameter("Quality parameters");
+        params.addDoubleParameter("noise",
+                "Noise sigma",
+                0.0,
+                "",
+                0.0,
+                50,
+                "The sigma value of Gaussian noise added to the image");
 
 //        params.addChoiceParameter("connectivity",
 //                "Connectivity",
@@ -166,15 +214,18 @@ public class ParameterAdjustmentCommand implements Runnable {
                 colTitle, colNumObjects, colMeanArea, colMeanIntensity
         );
         table.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY);
-        resultsProperty.addListener((v, o, n) -> {
-            if (n != null) {
-                table.getItems().setAll(n);
-                n.imageData.getHierarchy().clearAll();
-                n.imageData.getHierarchy().addObjects(n.getObjects());
-            } else {
-                table.getItems().clear();
-            }
+        resultsMap.addListener((MapChangeListener<ImageData<?>, AnalysisResult>) change -> {
+            table.getItems().setAll(resultsMap.values());
         });
+//        resultsProperty.addListener((v, o, n) -> {
+//            if (n != null) {
+//                table.getItems().setAll(n);
+//                n.imageData.getHierarchy().clearAll();
+//                n.imageData.getHierarchy().addObjects(n.getObjects());
+//            } else {
+//                table.getItems().clear();
+//            }
+//        });
 
         BorderPane parameterPane = new BorderPane(parameterPanel.getPane());
         parameterPane.setPadding(new Insets(5.0));
@@ -186,7 +237,7 @@ public class ParameterAdjustmentCommand implements Runnable {
         stage.setTitle(title);
         stage.setScene(new Scene(pane));
 
-        submitAnalysisTask(qupath.getImageData(), params);
+        submitAnalysisTasks(params);
 
         stage.setOnCloseRequest(e -> {
             parameterPanel.removeParameterChangeListener(parameterChangeListener);
@@ -198,6 +249,7 @@ public class ParameterAdjustmentCommand implements Runnable {
             }
             imageMap.clear();
             cachedResults.clear();
+            resultsMap.clear();
         });
         return stage;
     }
@@ -218,20 +270,36 @@ public class ParameterAdjustmentCommand implements Runnable {
 
 
     private void parameterChanged(ParameterList parameterList, String key, boolean isAdjusting) {
-        submitAnalysisTask(qupath.getImageData(), parameterList.duplicate());
+        submitAnalysisTasks(parameterList.duplicate());
+    }
+
+    private void submitAnalysisTasks(ParameterList parameterList) {
+        for (var viewer : qupath.getViewers()) {
+            submitAnalysisTask(viewer.getImageData(), parameterList);
+        }
     }
 
     private void submitAnalysisTask(ImageData<BufferedImage> imageData, ParameterList parameterList) {
         if (imageData == null)
             return;
-        pool.submit(() -> {
+        var future = pool.submit(() -> {
             try {
-                var result = runAnalysis(qupath.getImageData(), parameterList);
-                Platform.runLater(() -> resultsProperty.set(result));
-            } catch (IOException e) {
+                var result = runAnalysis(imageData, parameterList);
+                if (result == null)
+                    return;
+                Platform.runLater(() -> {
+                    imageData.getHierarchy().clearAll();
+                    imageData.getHierarchy().addObjects(result.getObjects());
+                    resultsMap.put(imageData, result);
+                });
+            } catch (Exception e) {
                 logger.error(e.getMessage(), e);
             }
         });
+        var previous = runningTasks.put(imageData, future);
+        if (previous != null && !previous.isDone()) {
+            previous.cancel(true);
+        }
     }
 
 
@@ -301,6 +369,9 @@ public class ParameterAdjustmentCommand implements Runnable {
     private AnalysisResult runAnalysis(ImageData<BufferedImage> imageData, ParameterList params) throws IOException {
         var paramsString = ParameterList.convertToJson(params);
 
+        if (Thread.interrupted())
+            return null;
+
         String key = imageData.getServer().getPath() + ":" + paramsString;
         if (cachedResults.containsKey(key)) {
             return cachedResults.get(key);
@@ -309,21 +380,69 @@ public class ParameterAdjustmentCommand implements Runnable {
         RegionRequest request = RegionRequest.createInstance(imageData.getServer(), imageData.getServer().getDownsampleForResolution(imageData.getServer().nResolutions()-1));
         var imp = imageMap.computeIfAbsent(imageData, id -> getImagePlus(id, request));
 
-        var ipOrig = imp.getProcessor();
-
+        imp.killRoi();
+        var ipOrig = imp.getProcessor().duplicate();
 
         var fp = imp.getProcessor().convertToFloatProcessor();
         double sigma = params.getDoubleParameterValue("gaussianSigma");
+        String thresholdMethod = (String)params.getChoiceParameterValue("autoThreshold");
         double threshold = params.getDoubleParameterValue("threshold");
         double tolerance = params.getDoubleParameterValue("tolerance");
+        double noise = params.getDoubleParameterValue("noise");
+
+        if (Thread.interrupted())
+            return null;
+
+        if (noise > 0) {
+            var noiseProcessor = noiseCache.computeIfAbsent(imp, imp2 -> {
+                var fpNoise = new FloatProcessor(imp2.getWidth(), imp2.getHeight());
+                fpNoise.noise(1.0);
+                return fpNoise;
+            });
+            float[] pixels = (float[]) fp.getPixels();
+            float[] noisePixels = (float[]) noiseProcessor.getPixels();
+            for (int i = 0; i < pixels.length; i++)
+                pixels[i] += noisePixels[i] * (float) noise;
+        }
+
+        for (var v : qupath.getViewers()) {
+            if (v.getImageData() == imageData) {
+                var channel = v.getImageDisplay().availableChannels().get(0);
+                fp.setMinAndMax(channel.getMinDisplay(), channel.getMaxDisplay());
+                var overlay = new BufferedImageOverlay(v, fp.getBufferedImage());
+                if (noise > 0)
+                    v.setCustomPixelLayerOverlay(overlay);
+                else
+                    v.resetCustomPixelLayerOverlay();
+                break;
+            }
+        }
+
+        if (Thread.interrupted())
+            return null;
+
 //        Connectivity connectivity = (Connectivity) params.getChoiceParameterValue("connectivity");
         Connectivity connectivity = Connectivity.FOUR_CONNECTED; // Doesn't matter with Maximum Finder involved
         if (sigma > 0)
             fp.blurGaussian(sigma);
 //        fp.setThreshold(sigma, 255, ImageProcessor.NO_LUT_UPDATE);
 
+        if (!Objects.equals(thresholdMethod, "Manual")) {
+            fp.setAutoThreshold(thresholdMethod, true, ImageProcessor.NO_LUT_UPDATE);
+            threshold = fp.getMinThreshold();
+        }
+
+        if (Thread.interrupted())
+            return null;
+
         ByteProcessor bp = new MaximumFinder().findMaxima(fp, tolerance, threshold, MaximumFinder.SEGMENTED, false, false);
+        if (Thread.interrupted())
+            return null;
+
         ImageProcessor ipLabels = RoiLabeling.labelImage(bp, 0.5f, connectivity == Connectivity.EIGHT_CONNECTED);
+
+        if (Thread.interrupted())
+            return null;
 
 //        ImageProcessor ipLabels = RoiLabeling.labelImage(fp, (float)threshold, connectivity == Connectivity.EIGHT_CONNECTED);
 
@@ -332,6 +451,9 @@ public class ParameterAdjustmentCommand implements Runnable {
         double maxArea = 0;
         if (n > 0) {
             Roi[] rois = RoiLabeling.labelsToConnectedROIs(ipLabels, n);
+            if (Thread.interrupted())
+                return null;
+
             for (Roi roi : rois) {
                 var pathObject = IJTools.convertToAnnotation(roi,
                         request.getMinX(), request.getMinY(),
@@ -363,11 +485,15 @@ public class ParameterAdjustmentCommand implements Runnable {
                 pathObject.setColor(color);
             }
 
+            if (Thread.interrupted())
+                return null;
+
 //            ipLabels = ipLabels.convertToFloat();
 //            SimpleImage simpleImage = SimpleImages.createFloatImage((float[])ipLabels.getPixels(), ipLabels.getWidth(), ipLabels.getHeight());
 //            List<PathObject> pathObjects = ContourTracing.createAnnotations(simpleImage, request, 1, -1);
         }
         var results = new AnalysisResult(imageData, paramsString, pathObjects);
+
         cachedResults.put(key, results);
         return results;
     }
