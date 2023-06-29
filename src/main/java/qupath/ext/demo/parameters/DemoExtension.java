@@ -1,4 +1,4 @@
-package qupath.ext.template;
+package qupath.ext.demo.parameters;
 
 import javafx.beans.property.BooleanProperty;
 import javafx.scene.control.MenuItem;
@@ -30,29 +30,23 @@ public class DemoExtension implements QuPathExtension {
 	/**
 	 * Display name for your extension
 	 */
-	private final static String EXTENSION_NAME = "My Java extension";
+	private final static String EXTENSION_NAME = "Image processing parameter demo";
 
 	/**
 	 * Short description, used under 'Extensions > Installed extensions'
 	 */
-	private final static String EXTENSION_DESCRIPTION = "This is just a demo to show how extensions work";
+	private final static String EXTENSION_DESCRIPTION = "This is a demo to show how image processing parameters impact";
 
 	/**
 	 * QuPath version that the extension is designed to work with.
 	 * This allows QuPath to inform the user if it seems to be incompatible.
 	 */
-	private final static Version EXTENSION_QUPATH_VERSION = Version.parse("v0.4.0");
+	private final static Version EXTENSION_QUPATH_VERSION = Version.parse("v0.4.3");
 
 	/**
 	 * Flag whether the extension is already installed (might not be needed... but we'll do it anyway)
 	 */
 	private boolean isInstalled = false;
-
-	/**
-	 * A 'persistent preference' - showing how to create a property that is stored whenever QuPath is closed
-	 */
-	private BooleanProperty enableExtensionProperty = PathPrefs.createPersistentPreference(
-			"enableExtension", true);
 
 	@Override
 	public void installExtension(QuPathGUI qupath) {
@@ -61,21 +55,7 @@ public class DemoExtension implements QuPathExtension {
 			return;
 		}
 		isInstalled = true;
-		addPreference(qupath);
 		addMenuItem(qupath);
-	}
-
-	/**
-	 * Demo showing how to add a persistent preference to the QuPath preferences pane.
-	 * @param qupath
-	 */
-	private void addPreference(QuPathGUI qupath) {
-		qupath.getPreferencePane().addPropertyPreference(
-				enableExtensionProperty,
-				Boolean.class,
-				"Enable my extension",
-				EXTENSION_NAME,
-				"Enable my extension");
 	}
 
 	/**
@@ -84,12 +64,9 @@ public class DemoExtension implements QuPathExtension {
 	 */
 	private void addMenuItem(QuPathGUI qupath) {
 		var menu = qupath.getMenu("Extensions>" + EXTENSION_NAME, true);
-		MenuItem menuItem = new MenuItem("My menu item");
-		menuItem.setOnAction(e -> {
-			Dialogs.showMessageDialog(EXTENSION_NAME,
-					"Hello! This is my Java extension.");
-		});
-		menuItem.disableProperty().bind(enableExtensionProperty.not());
+		MenuItem menuItem = new MenuItem("Parameter demo");
+		var command = new ParameterAdjustmentCommand(qupath);
+		menuItem.setOnAction(e -> command.run());
 		menu.getItems().add(menuItem);
 	}
 	
