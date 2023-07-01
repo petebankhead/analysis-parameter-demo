@@ -6,7 +6,6 @@ import ij.gui.Roi;
 import ij.measure.Measurements;
 import ij.plugin.filter.MaximumFinder;
 import ij.process.AutoThresholder;
-import ij.process.Blitter;
 import ij.process.ByteProcessor;
 import ij.process.FloatProcessor;
 import ij.process.ImageProcessor;
@@ -21,40 +20,37 @@ import javafx.beans.property.SimpleObjectProperty;
 import javafx.beans.property.SimpleStringProperty;
 import javafx.beans.property.StringProperty;
 import javafx.collections.FXCollections;
+import javafx.collections.ListChangeListener;
 import javafx.collections.MapChangeListener;
 import javafx.collections.ObservableMap;
 import javafx.geometry.Insets;
-import javafx.geometry.Orientation;
+import javafx.geometry.Pos;
+import javafx.scene.Node;
 import javafx.scene.Scene;
 import javafx.scene.chart.BarChart;
 import javafx.scene.chart.CategoryAxis;
 import javafx.scene.chart.NumberAxis;
 import javafx.scene.chart.XYChart;
+import javafx.scene.control.Button;
 import javafx.scene.control.Separator;
-import javafx.scene.control.SplitPane;
 import javafx.scene.control.TableCell;
 import javafx.scene.control.TableColumn;
 import javafx.scene.control.TableView;
 import javafx.scene.layout.BorderPane;
-import javafx.scene.layout.GridPane;
-import javafx.scene.layout.HBox;
-import javafx.scene.layout.Pane;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.VBox;
 import javafx.stage.Stage;
+import javafx.util.converter.NumberStringConverter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import qupath.imagej.processing.RoiLabeling;
 import qupath.imagej.processing.SimpleThresholding;
 import qupath.imagej.tools.IJTools;
-import qupath.lib.analysis.images.ContourTracing;
-import qupath.lib.analysis.images.SimpleImage;
-import qupath.lib.analysis.images.SimpleImages;
 import qupath.lib.analysis.stats.Histogram;
+import qupath.lib.analysis.stats.RunningStatistics;
 import qupath.lib.color.ColorMaps;
 import qupath.lib.common.ThreadTools;
 import qupath.lib.gui.QuPathGUI;
-import qupath.lib.gui.charts.HistogramPanelFX;
 import qupath.lib.gui.dialogs.Dialogs;
 import qupath.lib.gui.dialogs.ParameterPanelFX;
 import qupath.lib.gui.viewer.overlays.BufferedImageOverlay;
@@ -65,26 +61,23 @@ import qupath.lib.plugins.parameters.ParameterList;
 import qupath.lib.regions.ImagePlane;
 import qupath.lib.regions.RegionRequest;
 
-import java.awt.Color;
 import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.text.DecimalFormat;
 import java.text.NumberFormat;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.SortedSet;
 import java.util.TreeMap;
-import java.util.WeakHashMap;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.stream.Collectors;
 
 public class ParameterAdjustmentCommand implements Runnable {
 
@@ -121,10 +114,9 @@ public class ParameterAdjustmentCommand implements Runnable {
 
     private ExecutorService pool = Executors.newCachedThreadPool(ThreadTools.createThreadFactory("parameter-test", true));
 
-    private XYChart.Series<String, Number> seriesCounts = new XYChart.Series<>();
-    private XYChart.Series<String, Number> seriesMeanArea = new XYChart.Series<>();
-    private XYChart.Series<String, Number> seriesMeanIntensity = new XYChart.Series<>();
-
+    private XYChart.Series<Number, String> seriesCounts = new XYChart.Series<>();
+    private XYChart.Series<Number, String> seriesMeanArea = new XYChart.Series<>();
+    private XYChart.Series<Number, String> seriesMeanIntensity = new XYChart.Series<>();
 
     ParameterAdjustmentCommand(QuPathGUI qupath) {
         this.qupath = qupath;
@@ -159,7 +151,7 @@ public class ParameterAdjustmentCommand implements Runnable {
         params.addTitleParameter("Analysis parameters");
         params.addDoubleParameter("gaussianSigma",
                 "Gaussian sigma",
-                1.0,
+                0.0,
                 "px",
                 0.0,
                 5.0,
@@ -266,15 +258,24 @@ public class ParameterAdjustmentCommand implements Runnable {
         BorderPane pane = new BorderPane();
         pane.setTop(parameterPane);
 
-        var chartPane = new HBox(
+//        var chartPane = new HBox(
+//                createBarChart("Counts", seriesCounts),
+//                createBarChart("Mean area", seriesMeanArea),
+//                createBarChart("Mean intensity", seriesMeanIntensity)
+//        );
+//        for (var child : chartPane.getChildren()) {
+//            HBox.setHgrow(child, Priority.ALWAYS);
+//        }
+//        chartPane.setFillHeight(true);
+        var chartPane = new VBox(
                 createBarChart("Counts", seriesCounts),
                 createBarChart("Mean area", seriesMeanArea),
                 createBarChart("Mean intensity", seriesMeanIntensity)
         );
         for (var child : chartPane.getChildren()) {
-            HBox.setHgrow(child, Priority.ALWAYS);
+            VBox.setVgrow(child, Priority.ALWAYS);
         }
-        chartPane.setFillHeight(true);
+        chartPane.setFillWidth(true);
 //        var splitPane = new SplitPane(
 //                table,
 //                chartPane
@@ -282,6 +283,16 @@ public class ParameterAdjustmentCommand implements Runnable {
 //        splitPane.setOrientation(Orientation.VERTICAL);
 //        pane.setBottom(new BorderPane(splitPane));
         pane.setCenter(chartPane);
+        pane.setPadding(new Insets(5.0));
+
+        Button btnReset = new Button("Reset ranges");
+        BorderPane.setAlignment(btnReset, Pos.CENTER);
+        btnReset.setOnAction(e -> {
+            seriesCounts.getChart().getXAxis().setAutoRanging(true);
+            seriesMeanArea.getChart().getXAxis().setAutoRanging(true);
+            seriesMeanIntensity.getChart().getXAxis().setAutoRanging(true);
+        });
+        pane.setBottom(btnReset);
 
         Stage stage = new Stage();
         stage.initOwner(qupath.getStage());
@@ -319,10 +330,10 @@ public class ParameterAdjustmentCommand implements Runnable {
         }
     }
 
-    private BarChart<String, Number> createBarChart(String title, XYChart.Series<String, Number> series) {
+    private Node createBarChart(String title, XYChart.Series<Number, String> series) {
         var xAxis = new CategoryAxis();
         var yAxis = new NumberAxis();
-        BarChart<String, Number> barChart = new BarChart<>(xAxis, yAxis);
+        BarChart<Number, String> barChart = new BarChart<>(yAxis, xAxis);
         barChart.setTitle(title);
         barChart.getData().add(series);
         barChart.setPrefHeight(120.0);
@@ -342,15 +353,25 @@ public class ParameterAdjustmentCommand implements Runnable {
         });
         yAxis.setMinorTickVisible(false);
         yAxis.setTickMarkVisible(false);
-        yAxis.setAutoRanging(false);
-        yAxis.setLowerBound(0);
+//        yAxis.setAutoRanging(false);
+//        yAxis.setLowerBound(0);
+
+        // Need to retain reference?
+        new SeriesAxisLimiter(series);
+
         return barChart;
+//        var pane = new BorderPane(barChart);
+//        var cbLock = new CheckBox("");
+//        cbLock.setTooltip(new Tooltip("Lock bar length"));
+//        yAxis.autoRangingProperty().bind(cbLock.selectedProperty().not());
+//        pane.setRight(cbLock);
+//        return pane;
     }
 
     private void updateBarCharts() {
-        List<XYChart.Data<String, Number>> counts = new ArrayList<>();
-        List<XYChart.Data<String, Number>> areas = new ArrayList<>();
-        List<XYChart.Data<String, Number>> intensities = new ArrayList<>();
+        List<XYChart.Data<Number, String>> counts = new ArrayList<>();
+        List<XYChart.Data<Number, String>> areas = new ArrayList<>();
+        List<XYChart.Data<Number, String>> intensities = new ArrayList<>();
         int maxCounts = 0;
         double maxAreas = 0;
         double maxIntensities = 0;
@@ -364,41 +385,47 @@ public class ParameterAdjustmentCommand implements Runnable {
             maxAreas = Math.max(maxAreas, meanArea);
             var meanIntensity = result.meanIntensity.get();
             maxIntensities = Math.max(maxIntensities, meanIntensity);
-            counts.add(new XYChart.Data<>(title, numObjects));
-            areas.add(new XYChart.Data<>(title, meanArea));
-            intensities.add(new XYChart.Data<>(title, meanIntensity));
+            counts.add(new XYChart.Data<>(numObjects, title));
+            areas.add(new XYChart.Data<>(meanArea, title));
+            intensities.add(new XYChart.Data<>(meanIntensity, title));
         }
         seriesCounts.getData().setAll(counts);
-        var yAxis = ((NumberAxis)seriesCounts.getChart().getYAxis());
-        yAxis.setAutoRanging(false);
-        yAxis.setUpperBound(Math.max(yAxis.getUpperBound(), maxCounts * 1.1));
+//        expandAxisToMax((NumberAxis)seriesCounts.getChart().getXAxis(), maxCounts);
 
         seriesMeanArea.getData().setAll(areas);
-        yAxis = ((NumberAxis)seriesMeanArea.getChart().getYAxis());
-        yAxis.setAutoRanging(false);
-        yAxis.setUpperBound(Math.max(yAxis.getUpperBound(), maxAreas * 1.1));
+//        expandAxisToMax((NumberAxis)seriesMeanArea.getChart().getXAxis(), maxAreas);
 
         seriesMeanIntensity.getData().setAll(intensities);
-        yAxis = ((NumberAxis)seriesMeanIntensity.getChart().getYAxis());
-        yAxis.setAutoRanging(false);
-        yAxis.setUpperBound(Math.max(yAxis.getUpperBound(), maxIntensities * 1.1));
+//        expandAxisToMax((NumberAxis)seriesMeanIntensity.getChart().getXAxis(), maxIntensities);
 
+        setBarColors(seriesCounts);
+        setBarColors(seriesMeanArea);
+        setBarColors(seriesMeanIntensity);
+    }
+
+    private static void setBarColors(XYChart.Series<?, ?> series) {
         int count = 1;
-        for (var data : seriesCounts.getData()) {
-            data.getNode().setStyle("-fx-background-color: CHART_COLOR_" + count + ";");
-            count++;
-        }
-        count = 1;
-        for (var data : seriesMeanArea.getData()) {
-            data.getNode().setStyle("-fx-background-color: CHART_COLOR_" + count + ";");
-            count++;
-        }
-        count = 1;
-        for (var data : seriesMeanIntensity.getData()) {
-            data.getNode().setStyle("-fx-background-color: CHART_COLOR_" + count + ";");
+        for (var data : series.getData()) {
+            setBarColor(data, count);
             count++;
         }
     }
+
+    private static void setBarColor(XYChart.Data<?, ?> data, int count) {
+        var node = data.getNode();
+        if (node != null) {
+            node.setStyle("-fx-background-color: CHART_COLOR_" + (count % 8) + ";");
+        }
+    }
+
+
+    private static void expandAxisToMax(NumberAxis axis, double maxValue) {
+//        if (axis.autoRangingProperty().isBound())
+//            return; // Can't set if bound
+//        axis.setAutoRanging(false);
+//        axis.setUpperBound(Math.max(axis.getUpperBound(), maxValue * 1.1));
+    }
+
 
     private static <T> void setOrAdd(List<T> list, T item, int ind) {
         if (ind < list.size())
@@ -516,7 +543,7 @@ public class ParameterAdjustmentCommand implements Runnable {
             return cachedResults.get(key);
         }
 
-        RegionRequest request = RegionRequest.createInstance(imageData.getServer(), imageData.getServer().getDownsampleForResolution(imageData.getServer().nResolutions()-1));
+        RegionRequest request = RegionRequest.createInstance(imageData.getServer(), imageData.getServer().getDownsampleForResolution(imageData.getServer().nResolutions() - 1));
         var imp = imageMap.computeIfAbsent(imageData, id -> getImagePlus(id, request));
 
         imp.killRoi();
@@ -524,9 +551,9 @@ public class ParameterAdjustmentCommand implements Runnable {
 
         var fp = imp.getProcessor().convertToFloatProcessor();
         double sigma = params.getDoubleParameterValue("gaussianSigma");
-        String thresholdMethod = (String)params.getChoiceParameterValue("autoThreshold");
+        String thresholdMethod = (String) params.getChoiceParameterValue("autoThreshold");
         double threshold = params.getDoubleParameterValue("threshold");
-        boolean doWatershed =  params.containsKey("doWatershed") ?  params.getBooleanParameterValue("doWatershed") : true;
+        boolean doWatershed = params.containsKey("doWatershed") ? params.getBooleanParameterValue("doWatershed") : true;
         double tolerance = params.getDoubleParameterValue("tolerance");
 
         if (Thread.interrupted())
@@ -582,7 +609,7 @@ public class ParameterAdjustmentCommand implements Runnable {
         if (doWatershed)
             bp = new MaximumFinder().findMaxima(fp, tolerance, threshold, MaximumFinder.SEGMENTED, false, false);
         else
-            bp = SimpleThresholding.thresholdAbove(fp, (float)threshold);
+            bp = SimpleThresholding.thresholdAbove(fp, (float) threshold);
 
         if (Thread.interrupted())
             return null;
@@ -594,7 +621,7 @@ public class ParameterAdjustmentCommand implements Runnable {
 
 //        ImageProcessor ipLabels = RoiLabeling.labelImage(fp, (float)threshold, connectivity == Connectivity.EIGHT_CONNECTED);
 
-        int n = (int)ipLabels.getStatistics().max;
+        int n = (int) ipLabels.getStatistics().max;
         List<PathObject> pathObjects = new ArrayList<>();
         double maxArea = 0;
         if (n > 0) {
@@ -667,5 +694,71 @@ public class ParameterAdjustmentCommand implements Runnable {
         }
 
     }
+
+
+    static class SeriesAxisLimiter {
+
+        private final XYChart.Series<Number, String> series;
+        private final SortedSet<Double> values = new TreeSet<>(Comparator.reverseOrder());
+        private final RunningStatistics stats = new RunningStatistics();
+
+        SeriesAxisLimiter(XYChart.Series<Number, String> series) {
+            this.series = series;
+            this.series.getData().addListener(this::dataChanged);
+        }
+
+        private void dataChanged(ListChangeListener.Change<? extends XYChart.Data<Number, String>> c) {
+            double max = getMax(series.getData()) * 1.1;
+            NumberAxis axis = (NumberAxis) series.getChart().getXAxis();
+            if (!Double.isFinite(max))
+                return;
+            double currentMax = 0;
+            for (var data : series.getData()) {
+                Number value = data.getXValue();
+                if (value != null) {
+                    double doubleVal = value.doubleValue();
+                    values.add(doubleVal);
+                    stats.addValue(doubleVal);
+                    if (doubleVal > currentMax)
+                        currentMax = doubleVal;
+                }
+            }
+//            values.add(max);
+            double preferredUpperBound = getPreferredUpperBound(2);
+            axis.setAutoRanging(false);
+            double upperBound = Math.max(preferredUpperBound, currentMax);
+            axis.setUpperBound(upperBound);
+            axis.setTickLabelFormatter(new NumberStringConverter("0.#"));
+            axis.setTickUnit(upperBound / 10.0);
+        }
+
+        private double getPreferredUpperBound(double percentile) {
+            if (values.isEmpty())
+                return 0;
+//            double threshold = stats.getMean() + stats.getStdDev() * 3;
+//            System.err.println(threshold);
+//            for (Double d : values) {
+//                if (d <= threshold)
+//                    return d;
+//            }
+//            return threshold;
+
+            int ind = (int) (percentile / 100.0 * values.size());
+            int count = 0;
+            for (Double d : values) {
+                if (count == ind)
+                    return d;
+                count++;
+            }
+            return values.last();
+        }
+
+        private Double getMax(List<? extends XYChart.Data<Number, String>> data) {
+            return data.stream().mapToDouble(d -> d.getXValue().doubleValue()).max().orElse(Double.NaN);
+        }
+
+
+    }
+
 
 }
